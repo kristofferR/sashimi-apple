@@ -1751,6 +1751,21 @@ actor JellyfinClient {
         return components?.url
     }
 
+    /// The original file and the headers that authorize reading it, for
+    /// SpatialAudioBridge's range requests. The token goes in a header, not
+    /// the URL: the library logs network errors, which carry their URL.
+    func staticStreamRequest(itemId: String, mediaSourceId: String) -> (url: URL, headers: [String: String])? {
+        guard let serverURL, accessToken != nil else { return nil }
+        var components = URLComponents(string: serverURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")))
+        components?.path += "/Videos/\(itemId)/stream"
+        components?.queryItems = [
+            URLQueryItem(name: "Static", value: "true"),
+            URLQueryItem(name: "MediaSourceId", value: mediaSourceId)
+        ]
+        guard let url = components?.url else { return nil }
+        return (url, ["Authorization": authorizationHeader])
+    }
+
     /// Direct audio stream for a theme. `/Audio/{id}/universal` returns 400
     /// without a full device profile; `stream.mp3` serves the file as-is,
     /// which is what a theme is.
