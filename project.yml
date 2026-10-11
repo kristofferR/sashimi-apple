@@ -322,4 +322,4 @@ packages:
     from: "12.0.0"
   SpatialAudioBridge:
     url: https://github.com/kristofferR/SpatialAudioBridge
-    from: "1.3.0"
+    from: "1.4.0"
