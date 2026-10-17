@@ -1,0 +1,165 @@
+name: SpatialAudioBridge 2.0 validation (fork only)
+
+# Fork-local. Lives only on ci/sab-2.0-validation, which is the candidate
+# branch plus this file. Never publishes: no secrets, unsigned builds only.
+
+on:
+  push:
+    branches: [ci/sab-2.0-validation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sab-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  candidate:
+    name: Candidate
+    if: github.repository == 'kristofferR/sashimi-apple'
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Only this workflow differs from the candidate
+        id: sha
+        run: |
+          git diff --exit-code HEAD~1 HEAD -- . ':(exclude).github/workflows/sab-validation.yml'
+          echo "sha=$(git rev-parse HEAD~1)" >> "$GITHUB_OUTPUT"
+          echo "Candidate: $(git rev-parse HEAD~1)"
+
+  tvos:
+    name: Build tvOS App
+    needs: candidate
+    runs-on: macos-15
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: 'latest-stable'
+      - name: Install tvOS Platform
+        run: |
+          xcodebuild -version
+          if ! xcodebuild -showsdks | grep -q tvos; then
+            for _ in 1 2 3; do xcodebuild -downloadPlatform tvOS && break; sleep 10; done
+          fi
+      - name: Generate Xcode Project
+        run: brew install xcodegen && xcodegen generate
+      - name: Resolve Dependencies
+        run: |
+          xcodebuild -resolvePackageDependencies -project Sashimi.xcodeproj -scheme Sashimi -clonedSourcePackagesDirPath build/spm
+          grep -A6 -i spatialaudiobridge Sashimi.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+      - name: Build for tvOS Simulator
+        shell: bash
+        run: |
+          xcodebuild build -project Sashimi.xcodeproj -scheme Sashimi \
+            -destination 'generic/platform=tvOS Simulator' -configuration Debug \
+            -clonedSourcePackagesDirPath build/spm \
+            CODE_SIGNING_ALLOWED=NO | xcpretty --color
+      - name: Build for tvOS Device (Release, unsigned)
+        shell: bash
+        run: |
+          xcodebuild build -project Sashimi.xcodeproj -scheme Sashimi \
+            -sdk appletvos -configuration Release \
+            -clonedSourcePackagesDirPath build/spm -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO | xcpretty --color
+      - name: Package unsigned app
+        run: |
+          APP=build/dd/Build/Products/Release-appletvos/Sashimi.app
+          test -d "$APP"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist"
+          ls "$APP/Frameworks" || true
+          mkdir -p out && ditto -c -k --keepParent "$APP" out/Sashimi-unsigned-Release-appletvos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sashimi-unsigned-Release-appletvos-${{ needs.candidate.outputs.sha }}
+          path: out/Sashimi-unsigned-Release-appletvos.zip
+          retention-days: 14
+      - name: Create tvOS Simulator
+        run: |
+          sudo xcodebuild -downloadPlatform tvOS || xcodebuild -downloadPlatform tvOS
+          RUNTIME=$(xcrun simctl list runtimes tvOS | grep -oE 'com.apple.CoreSimulator.SimRuntime.tvOS[-0-9]+' | tail -1)
+          echo "Using runtime: $RUNTIME"
+          xcrun simctl create "ci-atv" "Apple TV 4K (3rd generation)" "$RUNTIME"
+      - name: Run Tests
+        shell: bash
+        run: |
+          xcodebuild test -project Sashimi.xcodeproj -scheme Sashimi \
+            -destination 'platform=tvOS Simulator,name=ci-atv' \
+            -clonedSourcePackagesDirPath build/spm -resultBundlePath build/tvos-tests.xcresult \
+            CODE_SIGNING_ALLOWED=NO | xcpretty --color
+
+      - name: Upload test results
+        if: always()
+        run: ditto -c -k --keepParent build/tvos-tests.xcresult out/tvos-tests.xcresult.zip || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tvos-tests-xcresult-${{ needs.candidate.outputs.sha }}-${{ github.run_attempt }}
+          path: out/tvos-tests.xcresult.zip
+          retention-days: 7
+
+  ios:
+    name: Build iOS App
+    needs: candidate
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: 'latest-stable'
+      - name: Generate Xcode Project
+        run: brew install xcodegen && xcodegen generate
+      - name: Build for iOS Simulator
+        shell: bash
+        run: |
+          xcodebuild build -project Sashimi.xcodeproj -scheme SashimiMobile \
+            -destination 'generic/platform=iOS Simulator' -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO | xcpretty --color
+      - name: Build for Mac Catalyst
+        shell: bash
+        run: |
+          xcodebuild build -project Sashimi.xcodeproj -scheme SashimiMobile \
+            -destination 'generic/platform=macOS,variant=Mac Catalyst' -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO | xcpretty --color
+      - name: Create iOS Simulator
+        run: |
+          RUNTIMES_JSON=$(xcrun simctl list runtimes --json)
+          RUNTIME=$(echo "$RUNTIMES_JSON" | jq -r '[.runtimes[] | select(.platform == "iOS" and .isAvailable)] | sort_by(.version | split(".") | map(tonumber)) | last | .identifier // empty')
+          DEVICE_TYPE=$(echo "$RUNTIMES_JSON" | jq -r --arg r "$RUNTIME" '.runtimes[] | select(.identifier == $r) | .supportedDeviceTypes | map(select(.productFamily == "iPhone")) | last | .identifier // empty')
+          test -n "$RUNTIME" && test -n "$DEVICE_TYPE"
+          xcrun simctl create "ci-iphone" "$DEVICE_TYPE" "$RUNTIME"
+      - name: Run Tests
+        shell: bash
+        run: |
+          xcodebuild test -project Sashimi.xcodeproj -scheme SashimiMobile \
+            -destination 'platform=iOS Simulator,name=ci-iphone' \
+            CODE_SIGNING_ALLOWED=NO | xcpretty --color
+
+  swiftlint:
+    name: SwiftLint
+    needs: candidate
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Run SwiftLint (pinned as upstream CI)
+        env:
+          SWIFTLINT_VERSION: "0.63.0"
+        run: |
+          curl -fsSL -o /tmp/swiftlint.zip "https://github.com/realm/SwiftLint/releases/download/${SWIFTLINT_VERSION}/portable_swiftlint.zip"
+          unzip -qo /tmp/swiftlint.zip -d /tmp/swiftlint
+          /tmp/swiftlint/swiftlint lint --strict --reporter github-actions-logging
