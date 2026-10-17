@@ -1,0 +1,69 @@
+name: SAB PR 116 validation (fork only)
+
+# Fork-local test build: Sashimi without its 20 s start lead, against
+# SpatialAudioBridge f2f48b2 with the 2.0.0 core. Never publishes.
+
+on:
+  push:
+    branches: [ci/sab-116-validation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sab-116-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tvos:
+    name: Build tvOS App (SAB f2f48b2)
+    if: github.repository == 'kristofferR/sashimi-apple'
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      SAB_SHA: f2f48b2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: 'latest-stable'
+      - name: SpatialAudioBridge at the fix, with the 2.0.0 core
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git clone --quiet https://github.com/kristofferR/SpatialAudioBridge.git Vendor/SpatialAudioBridge
+          git -C Vendor/SpatialAudioBridge checkout --quiet "$SAB_SHA"
+          git -C Vendor/SpatialAudioBridge log --oneline -1
+          gh release download 2.0.0 --repo kristofferR/SpatialAudioBridge -p SpatialAudioCore.xcframework.zip -D /tmp/core
+          mkdir -p Vendor/SpatialAudioBridge/BinaryArtifacts
+          unzip -q /tmp/core/SpatialAudioCore.xcframework.zip 'SpatialAudioCore.xcframework/*' -d Vendor/SpatialAudioBridge/BinaryArtifacts
+          ls Vendor/SpatialAudioBridge/BinaryArtifacts/SpatialAudioCore.xcframework
+          grep -n 'restarts behind the run' Vendor/SpatialAudioBridge/Sources/SpatialAudioBridge/APACStream.swift
+      - name: No start lead
+        run: '! grep -n spatialAudioStartLead Shared/ViewModels/PlayerViewModel/PlayerViewModel+SpatialAudio.swift'
+      - name: Install tvOS Platform
+        run: |
+          if ! xcodebuild -showsdks | grep -q tvos; then
+            for _ in 1 2 3; do xcodebuild -downloadPlatform tvOS && break; sleep 10; done
+          fi
+      - name: Generate Xcode Project
+        run: brew install xcodegen && xcodegen generate
+      - name: Build for tvOS Device (Release, unsigned)
+        shell: bash
+        run: |
+          xcodebuild build -project Sashimi.xcodeproj -scheme Sashimi \
+            -sdk appletvos -configuration Release -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO | xcpretty --color
+      - name: Package unsigned app
+        run: |
+          APP=build/dd/Build/Products/Release-appletvos/Sashimi.app
+          ls "$APP/Frameworks"
+          mkdir -p out && ditto -c -k --keepParent "$APP" out/Sashimi-unsigned-Release-appletvos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sashimi-sab116-unsigned-Release-appletvos-${{ github.sha }}
+          path: out/Sashimi-unsigned-Release-appletvos.zip
+          retention-days: 7
